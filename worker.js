@@ -91,28 +91,37 @@ function isBotOrOrg(userAgent, orgInfo) {
 async function isIpFlagged(ip) {
   if (!ip) return false;
   if (flaggedIps.has(ip)) return true;
+  // Optional keys (settings rows 16-17): a blank key skips its check
+  // entirely instead of calling the API with an empty credential.
+  const iphubKey = String(CONFIG.iphubKey || "").trim();
+  const abuseKey = String(CONFIG.abuseKey || "").trim();
+  if (!iphubKey && !abuseKey) return false;
   try {
-    let response = await fetch(CONFIG.iphubUrl + ip, {
-      headers: { "X-Key": CONFIG.iphubKey },
-      signal: AbortSignal.timeout(2000)
-    });
-    if (response.status === 200) {
-      const data = await response.json();
-      if ((data.block === undefined ? 0 : data.block) === 1) {
-        flaggedIps.add(ip);
-        return true;
+    if (iphubKey) {
+      const iphubResponse = await fetch(CONFIG.iphubUrl + ip, {
+        headers: { "X-Key": iphubKey },
+        signal: AbortSignal.timeout(2000)
+      });
+      if (iphubResponse.status === 200) {
+        const data = await iphubResponse.json();
+        if ((data.block === undefined ? 0 : data.block) === 1) {
+          flaggedIps.add(ip);
+          return true;
+        }
       }
     }
-    response = await fetch(CONFIG.abuseUrl + ip, {
-      headers: { "Key": CONFIG.abuseKey, "Accept": "application/json" },
-      signal: AbortSignal.timeout(2000)
-    });
-    if (response.status === 200) {
-      const data = await response.json();
-      const score = (data && data.data && data.data.abuseConfidenceScore) || 0;
-      if (score > 50) {
-        flaggedIps.add(ip);
-        return true;
+    if (abuseKey) {
+      const abuseResponse = await fetch(CONFIG.abuseUrl + ip, {
+        headers: { "Key": abuseKey, "Accept": "application/json" },
+        signal: AbortSignal.timeout(2000)
+      });
+      if (abuseResponse.status === 200) {
+        const data = await abuseResponse.json();
+        const score = (data && data.data && data.data.abuseConfidenceScore) || 0;
+        if (score > 50) {
+          flaggedIps.add(ip);
+          return true;
+        }
       }
     }
   } catch (e) {
@@ -619,7 +628,12 @@ async function siteverify(token, ip) {
 
 // Returns a Response when the gate must intervene, or null when the
 // visitor already holds a valid gate cookie.
+// Optional secret (settings row 18): blank = gate fully off (siteverify
+// with an empty secret could never pass, so the challenge would deadlock
+// every visitor). With a secret the gate runs at full strength.
 async function gateCheck(request, url, ip) {
+  if (!String(CONFIG.turnstileSecret || "").trim()) return null;
+
   if (request.method === "POST" && url.pathname === "/__wf_gate") {
     let token = "";
     let to = url.searchParams.get("retry") || "/";
