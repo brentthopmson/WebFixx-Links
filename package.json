@@ -1,0 +1,7 @@
+{
+  "name": "webfixx-links",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Edge link engine for WebFixx-Hoo — per-link Cloudflare Worker serving template and redirect pages with verified Turnstile gating."
+}
