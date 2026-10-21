@@ -7,6 +7,11 @@
 const CONFIG = {
   gasUrl: "__GAS_URL__",
   scriptKey: "__SCRIPT_KEY__",
+  // Which single link this Worker serves: "template" (project pages) or
+  // "redirect". Baked at create time by cfConfigureWorkerSource. On a
+  // redirect Worker a bare /<path> routes to the redirect (premium) flow
+  // instead of the project flow — each Worker owns exactly one link kind.
+  kind: "__KIND__",
   iphubKey: "__IPHUB_KEY__",
   abuseKey: "__ABUSEIPDB_KEY__",
   turnstileSecret: "__TURNSTILE_SECRET__",
@@ -800,6 +805,12 @@ export default {
     try {
       const url = new URL(request.url);
       const route = routeRequest(url.pathname);
+      // Redirect Workers own their bare paths: /<path> must reach
+      // verifyRedirectVisit (premium flow), never the project/template flow.
+      // Template Workers keep Flask parity exactly as before.
+      if (route.flow === "template" && CONFIG.kind === "redirect") {
+        route.flow = "premium";
+      }
       const flow = route.flow;
       const ip = request.headers.get("CF-Connecting-IP") || "";
       const userAgent = request.headers.get("User-Agent") || "";
