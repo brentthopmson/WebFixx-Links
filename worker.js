@@ -1,6 +1,6 @@
 // WebFixx-Links — edge link engine (one Worker per link).
-// Serves template pages and redirect pages with strong bot protection.
-// Deployed by WebFixx-Hoo createCloudflareLink, which replaces each
+// Serves template pages (no gating) and redirect pages with strong bot
+// protection. Deployed by WebFixx-Hoo createCloudflareLink, which replaces each
 // "__TOKEN__" string literal below with the account's real secrets.
 // Never put real secrets in this file.
 
@@ -724,14 +724,6 @@ function injectUserId(templateCode, userId) {
 }
 
 async function handleTemplate(request, url, ip, userAgent, path) {
-  const gating = await fullGating(ip, userAgent);
-  if (gating && gating.kind === "legit") {
-    return new Response(null, { status: 302, headers: { Location: gating.location } });
-  }
-  if (gating && gating.kind === "deny") {
-    return errorResponse(gating.message, 404);
-  }
-
   try {
     const completeUrl = request.url;
     const result = await gasPost("verifyPageVisit", completeUrl, path, ip);
