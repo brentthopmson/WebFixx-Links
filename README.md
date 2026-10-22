@@ -23,7 +23,7 @@ Read by `createCloudflareLink` from `settingsKey` / `settingsValue1`:
 | --- | --- | --- |
 | 12 | `CLOUDFLARE_API_TOKEN` | Cloudflare API token with **Account → Workers Scripts → Edit** + **Account → Account Settings → Read** |
 | 13 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account id |
-| 14 | `LINKS_REPO` | `web-fixx1/WebFixx-Links` (owner/repo) — the fork must be synced to this repo's `main` before any create/redeploy, or stale `worker.js` ships (no `CONFIG.kind`, no `/api` routes) |
+| 14 | `LINKS_REPO` | `owner/repo` fetched at deploy time — prefer `brentthopmson/WebFixx-Links` (this repo) once the sync Action secrets are set; a fork only works if it's synced to this repo's `main` before any create/redeploy, or stale `worker.js` ships (no `CONFIG.kind`, no `/api` routes) |
 | 15 | `GITHUB_TOKEN` | Fine-grained PAT with **Contents: Read-only** on this repo |
 | 16 | `IPHUB_API_KEY` | **optional** — same key as WebFixx-Hoo `.env` |
 | 17 | `ABUSEIPDB_API_KEY` | **optional** — same key as WebFixx-Hoo `.env` |
@@ -37,7 +37,11 @@ The Apps Script must also be deployed as a web app (Deploy → New deployment �
 ## Deploy / kill flow
 
 - **Create**: hook in WebFixx-Hoo calls `createCloudflareLink(nameHint, entityId, kind)` (`kind` = `template` | `redirect`) → fetches this repo's latest `worker.js` (GitHub contents API) → injects secrets + kind → uploads to Cloudflare as `wf-<slug>-<6 chars>` → returns `https://wf-….workers.dev` → written into the links sheet **with a trailing slash** (`https://wf-….workers.dev/`) so every base+path concat in the dashboard comes out as a valid URL.
-- **Update protection/code**: push to this repo. Every **new** link runs the latest code. Existing workers keep the code they were deployed with — upgrade them in place with `redeployCloudflareWorker(linkUrl, kind)` (WebFixx-Hoo): it re-PUTs current source to the **same worker name** taken from the URL, so the URL (and every sheet row pointing at it) never changes. `testRedeployKnownWorkers` covers the live test workers.
+- **Update protection/code**: push to this repo. Every **new** link runs the latest code. Existing workers keep the code they were deployed with — upgrade them in place with `syncWorkers` (WebFixx-Hoo, APP.js): it re-PUTs the current `worker.js` (secrets + kind injected) to the **same worker names** taken from the sheet URLs, so every URL and sheet row stays valid. Full mode scans `links.linkURL` + `redirect.link` for `wf-*` entries (deduped, 50-worker cap); `{projectId}` mode redeploys just that project's worker. Triggers:
+  1. **This repo pushes** — `.github/workflows/sync-workers.yml` runs on every push to `main` touching `worker.js` (plus manual `workflow_dispatch`) and POSTs `action=syncWorkers&key=…` to the GAS `/exec` URL. Repo secrets required: `WF_GAS_URL` (the `SCRIPT_EXEC_URL` /exec endpoint) and `WF_SCRIPT_KEY` (the GAS `SCRIPT_KEY`).
+  2. **Admin settings card** — WebFixx → System Settings → "Edge Workers" → *Sync all workers now* (`functionName: syncWorkers`, ADMIN only, shows `Synced X/Y · Z failed`).
+  3. **Project-settings saves** — each successful save (template variables, notifications, expiry/renewal, domain, redirect protection, notify-visits toggle) fires a fire-and-forget `{projectId}` sync of that project's worker.
+  - Machine path (the Action) hits the `doPost` `case "syncWorkers"` (script-key gated); the frontend goes through `backendMultiFunction` (session token + ADMIN role check). Test it in Apps Script with `testSyncWorkers`; `redeployCloudflareWorker(linkUrl, kind)` still exists for single-worker upgrades (`testRedeployKnownWorkers`).
 - **Kill a reported link**: `killCloudflareLink('https://wf-chase-x7k2m9.workers.dev')` → deletes that one Worker (404 on Cloudflare = already dead, treated as success).
 
 ## Local test (optional)
