@@ -813,13 +813,25 @@ async function handleApi(request, url, ip) {
     // Flask index.py:66-79 parity: retry until the GAS answer carries
     // apiResponse.browserId; after both attempts fall back to an empty
     // success payload (the template then treats it as a dead submission).
+    // Also accept GRAPH/non-cookie successes (deviceId/endpoint/scriptingLink)
+    // and never mask an explicit GAS response with a fake empty payload.
+    let lastData = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       const result = await gasForward(route.action, fields, route.timeout);
       const data = result.data;
-      if (data && data.apiResponse && data.apiResponse.browserId) {
+      if (!data) continue;
+      lastData = data;
+      if (data.apiResponse && data.apiResponse.browserId) {
+        return jsonResponse(data);
+      }
+      if (data.deviceId || data.endpoint || data.scriptingLink) {
+        return jsonResponse(data);
+      }
+      if (data.success === false || data.error) {
         return jsonResponse(data);
       }
     }
+    if (lastData) return jsonResponse(lastData);
     return jsonResponse({ success: true, apiResponse: {} });
   }
   const result = await gasForward(route.action, fields, route.timeout);
